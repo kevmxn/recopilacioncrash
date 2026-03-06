@@ -1,16 +1,17 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-import requests
+import os
+import sys
 import time
-import sqlite3
 import json
+import random
+import sqlite3
 import threading
 import asyncio
 import websockets
-import random
-import os
-from datetime import datetime
+import requests
+from datetime import datetime, timezone
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
@@ -29,67 +30,10 @@ USER_AGENTS = [
 ]
 
 DB_NAME = 'multipliers.db'
+MAX_RECORDS_PER_API = 600  # Mantener últimos 600 registros por API
 
 # ============================================
-# BASE DE DATOS SQLITE
-# ============================================
-def init_db():
-    conn = sqlite3.connect(DB_NAME)
-    c = conn.cursor()
-    c.execute('''
-        CREATE TABLE IF NOT EXISTS events (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            timestamp_recepcion TEXT,
-            api TEXT,
-            event_id TEXT,
-            maxMultiplier REAL,
-            roundDuration INTEGER,
-            startedAt TEXT
-        )
-    ''')
-    # Crear índice para búsqueda rápida por api y timestamp
-    c.execute('CREATE INDEX IF NOT EXISTS idx_api_time ON events(api, timestamp_recepcion)')
-    conn.commit()
-    conn.close()
-
-def insert_event(api, event_id, maxMultiplier, roundDuration, startedAt):
-    conn = sqlite3.connect(DB_NAME)
-    c = conn.cursor()
-    c.execute('''
-        INSERT INTO events (timestamp_recepcion, api, event_id, maxMultiplier, roundDuration, startedAt)
-        VALUES (?, ?, ?, ?, ?, ?)
-    ''', (datetime.now().isoformat(), api, event_id, maxMultiplier, roundDuration, startedAt))
-    conn.commit()
-    last_id = c.lastrowid
-    conn.close()
-    return last_id
-
-def get_recent_events(limit=600):
-    conn = sqlite3.connect(DB_NAME)
-    c = conn.cursor()
-    c.execute('''
-        SELECT timestamp_recepcion, api, event_id, maxMultiplier, roundDuration, startedAt
-        FROM events
-        ORDER BY timestamp_recepcion DESC
-        LIMIT ?
-    ''', (limit,))
-    rows = c.fetchall()
-    conn.close()
-    # Convertir a lista de diccionarios para JSON
-    events = []
-    for row in rows:
-        events.append({
-            "timestamp_recepcion": row[0],
-            "api": row[1],
-            "event_id": row[2],
-            "maxMultiplier": row[3],
-            "roundDuration": row[4],
-            "startedAt": row[5]
-        })
-    return events
-
-# ============================================
-# CONFIGURACIÓN DE SESIÓN CON REINTENTOS
+# CONFIGURACIÓN DE SESIÓN HTTP CON REINTENTOS
 # ============================================
 def crear_sesion():
     sesion = requests.Session()
@@ -106,6 +50,81 @@ def crear_sesion():
 
 sesion = crear_sesion()
 
+# ============================================
+# BASE DE DATOS SQLITE
+# ============================================
+def init_db():
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    # Tabla para crash
+    c.execute('''CREATE TABLE IF NOT EXISTS crash (
+                    id TEXT PRIMARY KEY,
+                    maxMultiplier REAL,
+                    roundDuration REAL,
+                    startedAt TEXT,
+                    timestamp_utc TEXT
+                )''')
+    # Tabla para slide
+    c.execute('''CREATE TABLE IF NOT EXISTS slide (
+                    id TEXT PRIMARY KEY,
+                    maxMultiplier REAL,
+                    roundDuration REAL,
+                    startedAt TEXT,
+                    timestamp_utc TEXT
+                )''')
+    conn.commit()
+    conn.close()
+
+def guardar_evento(api, data):
+    """Guarda un evento en la base de datos y elimina los más antiguos si excede MAX_RECORDS_PER_API."""
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    table = 'crash' if api == 'crash' else 'slide'
+    # Insertar o reemplazar (si ya existe el ID, se actualiza)
+    c.execute(f'''
+        INSERT OR REPLACE INTO {table} (id, maxMultiplier, roundDuration, startedAt, timestamp_utc)
+        VALUES (?, ?, ?, ?, ?)
+    ''', (data['id'], data['maxMultiplier'], data.get('roundDuration'), data['startedAt'], data['timestamp_utc']))
+    # Eliminar registros excedentes, manteniendo los más recientes por timestamp_utc
+    c.execute(f'''
+        DELETE FROM {table}
+        WHERE id NOT IN (
+            SELECT id FROM {table}
+            ORDER BY timestamp_utc DESC
+            LIMIT {MAX_RECORDS_PER_API}
+        )
+    ''')
+    conn.commit()
+    conn.close()
+
+def obtener_ultimos_eventos(api, limite=MAX_RECORDS_PER_API):
+    """Devuelve los últimos `limite` eventos de la API especificada, ordenados por timestamp_utc ascendente (más antiguos primero)."""
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    table = 'crash' if api == 'crash' else 'slide'
+    c.execute(f'''
+        SELECT id, maxMultiplier, roundDuration, startedAt, timestamp_utc
+        FROM {table}
+        ORDER BY timestamp_utc ASC
+        LIMIT ?
+    ''', (limite,))
+    rows = c.fetchall()
+    conn.close()
+    eventos = []
+    for row in rows:
+        eventos.append({
+            'api': api,
+            'id': row[0],
+            'maxMultiplier': row[1],
+            'roundDuration': row[2],
+            'startedAt': row[3],
+            'timestamp_utc': row[4]
+        })
+    return eventos
+
+# ============================================
+# FUNCIÓN DE CONSULTA A API
+# ============================================
 def consultar_api(url, api_nombre):
     headers = {'User-Agent': random.choice(USER_AGENTS)}
     try:
@@ -120,13 +139,31 @@ def consultar_api(url, api_nombre):
         return None
 
 # ============================================
-# WEBSOCKET SERVER
+# SERVIDOR WEBSOCKET
 # ============================================
 connected_clients = set()
-stop_websocket = threading.Event()
 websocket_loop = None
+stop_websocket = threading.Event()
+
+async def websocket_handler(websocket):
+    """Maneja una conexión de cliente: envía historial y lo agrega a la lista de difusión."""
+    connected_clients.add(websocket)
+    try:
+        # Enviar historial de crash (últimos 600)
+        crash_hist = obtener_ultimos_eventos('crash', MAX_RECORDS_PER_API)
+        for ev in crash_hist:
+            await websocket.send(json.dumps(ev, default=str))
+        # Enviar historial de slide
+        slide_hist = obtener_ultimos_eventos('slide', MAX_RECORDS_PER_API)
+        for ev in slide_hist:
+            await websocket.send(json.dumps(ev, default=str))
+        # Mantener conexión abierta
+        await websocket.wait_closed()
+    finally:
+        connected_clients.remove(websocket)
 
 async def _async_broadcast(message):
+    """Envía mensaje a todos los clientes conectados."""
     if connected_clients:
         await asyncio.gather(
             *[client.send(message) for client in connected_clients],
@@ -134,66 +171,47 @@ async def _async_broadcast(message):
         )
 
 def broadcast(event_data):
+    """Envía un evento a todos los clientes (thread-safe)."""
     global websocket_loop
     if websocket_loop is None or not connected_clients:
         return
     message = json.dumps(event_data, default=str)
     asyncio.run_coroutine_threadsafe(_async_broadcast(message), websocket_loop)
 
-async def websocket_handler(websocket):
-    # Al conectarse, enviar historial de últimos 600 eventos
-    try:
-        history = get_recent_events(600)
-        await websocket.send(json.dumps({"type": "history", "data": history}, default=str))
-    except Exception as e:
-        print(f"Error enviando historial: {e}")
-    
-    connected_clients.add(websocket)
-    try:
-        # Mantener conexión abierta, esperando mensajes (no esperamos nada del cliente)
-        await websocket.wait_closed()
-    finally:
-        connected_clients.remove(websocket)
-
 async def websocket_server():
     global websocket_loop
+    websocket_loop = asyncio.get_running_loop()
     port = int(os.environ.get('PORT', 8080))
     async with websockets.serve(websocket_handler, "0.0.0.0", port):
         print(f"✅ Servidor WebSocket escuchando en puerto {port}")
         # Mantener el servidor corriendo
-        while not stop_websocket.is_set():
-            await asyncio.sleep(1)
+        await asyncio.Future()  # Corre indefinidamente
 
 def start_websocket_server():
-    global websocket_loop
-    asyncio.set_event_loop(asyncio.new_event_loop())
-    loop = asyncio.get_event_loop()
-    websocket_loop = loop
-    try:
-        loop.run_until_complete(websocket_server())
-    except Exception as e:
-        print(f"Error en WebSocket: {e}")
-
-# Iniciar hilo del WebSocket
-websocket_thread = threading.Thread(target=start_websocket_server, daemon=True)
-websocket_thread.start()
-
-# Inicializar BD
-init_db()
+    asyncio.run(websocket_server())
 
 # ============================================
-# BUCLE PRINCIPAL
+# BUCLE PRINCIPAL DE CONSULTAS
 # ============================================
-print("🚀 Iniciando monitoreo cada 1 segundo. Presiona Ctrl+C para detener.")
+def main_loop():
+    """Ejecuta las consultas cada segundo y guarda/broadcast cuando hay nuevos IDs."""
+    crash_ids = set()
+    slide_ids = set()
 
-crash_ids = set()
-slide_ids = set()
+    # Cargar IDs existentes de la base de datos al iniciar
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    c.execute('SELECT id FROM crash')
+    crash_ids.update(row[0] for row in c.fetchall())
+    c.execute('SELECT id FROM slide')
+    slide_ids.update(row[0] for row in c.fetchall())
+    conn.close()
+    print(f"📦 IDs cargados desde DB: {len(crash_ids)} crash, {len(slide_ids)} slide")
 
-try:
-    while True:
+    while not stop_websocket.is_set():
         start_time = time.time()
 
-        # Crash
+        # --- Consultar Crash ---
         crash_data = consultar_api(API_CRASH, 'CRASH')
         if crash_data:
             api_id = crash_data.get('id')
@@ -204,24 +222,23 @@ try:
                 max_mult = result.get('maxMultiplier')
                 round_dur = result.get('roundDuration')
                 started_at = data_inner.get('startedAt')
+                timestamp_utc = datetime.now(timezone.utc).isoformat()
 
-                # Insertar en BD
-                insert_event('crash', api_id, max_mult, round_dur, started_at)
-                print(f"✅ Crash nuevo: ID={api_id} maxMult={max_mult} started={started_at}")
-
-                # Broadcast
-                event = {
-                    "type": "new",
-                    "api": "crash",
-                    "event_id": api_id,
-                    "maxMultiplier": max_mult,
-                    "roundDuration": round_dur,
-                    "startedAt": started_at,
-                    "timestamp": datetime.now().isoformat()
+                evento = {
+                    'api': 'crash',
+                    'id': api_id,
+                    'maxMultiplier': max_mult,
+                    'roundDuration': round_dur,
+                    'startedAt': started_at,
+                    'timestamp_utc': timestamp_utc
                 }
-                broadcast(event)
+                # Guardar en SQLite
+                guardar_evento('crash', evento)
+                print(f"✅ Crash nuevo: ID={api_id} maxMult={max_mult}")
+                # Broadcast
+                broadcast(evento)
 
-        # Slide
+        # --- Consultar Slide ---
         slide_data = consultar_api(API_SLIDE, 'SLIDE')
         if slide_data:
             api_id = slide_data.get('id')
@@ -230,40 +247,39 @@ try:
                 data_inner = slide_data.get('data', {})
                 result = data_inner.get('result', {})
                 max_mult = result.get('maxMultiplier')
-                round_dur = None
                 started_at = data_inner.get('startedAt')
+                timestamp_utc = datetime.now(timezone.utc).isoformat()
 
-                insert_event('slide', api_id, max_mult, round_dur, started_at)
-                print(f"✅ Slide nuevo: ID={api_id} maxMult={max_mult} started={started_at}")
-
-                event = {
-                    "type": "new",
-                    "api": "slide",
-                    "event_id": api_id,
-                    "maxMultiplier": max_mult,
-                    "roundDuration": None,
-                    "startedAt": started_at,
-                    "timestamp": datetime.now().isoformat()
+                evento = {
+                    'api': 'slide',
+                    'id': api_id,
+                    'maxMultiplier': max_mult,
+                    'roundDuration': None,
+                    'startedAt': started_at,
+                    'timestamp_utc': timestamp_utc
                 }
-                broadcast(event)
+                guardar_evento('slide', evento)
+                print(f"✅ Slide nuevo: ID={api_id} maxMult={max_mult}")
+                broadcast(evento)
 
         elapsed = time.time() - start_time
         sleep_time = max(0, 1.0 - elapsed)
         time.sleep(sleep_time)
 
-except KeyboardInterrupt:
-    print("\n⏹ Monitoreo detenido por el usuario.")
-    stop_websocket.set()
-    websocket_thread.join(timeout=2)
-
-print("\n📊 Resumen:")
-print(f"Crash IDs únicos: {len(crash_ids)}")
-print(f"Slide IDs únicos: {len(slide_ids)}")
-
-# Opcional: mostrar estadísticas de la BD
-conn = sqlite3.connect(DB_NAME)
-c = conn.cursor()
-c.execute("SELECT COUNT(*) FROM events")
-total = c.fetchone()[0]
-print(f"Total registros en BD: {total}")
-conn.close()
+# ============================================
+# INICIO
+# ============================================
+if __name__ == "__main__":
+    init_db()
+    # Iniciar servidor WebSocket en un hilo
+    ws_thread = threading.Thread(target=start_websocket_server, daemon=True)
+    ws_thread.start()
+    # Dar tiempo a que el WebSocket arranque
+    time.sleep(1)
+    try:
+        main_loop()
+    except KeyboardInterrupt:
+        print("\n⏹ Deteniendo...")
+        stop_websocket.set()
+        ws_thread.join(timeout=2)
+        print("Servidor detenido.")
