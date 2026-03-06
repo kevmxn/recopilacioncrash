@@ -13,7 +13,6 @@ import random
 from datetime import datetime
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
-import websocket  # websocket-client para Spaceman
 
 # ============================================
 # CONFIGURACIÓN
@@ -21,22 +20,50 @@ import websocket  # websocket-client para Spaceman
 API_CRASH = 'https://api-cs.casino.org/svc-evolution-game-events/api/stakecrash/latest'
 API_SLIDE = 'https://api-cs.casino.org/svc-evolution-game-events/api/stakeslide/latest'
 
-# Spaceman (Pragmatic Play)
-SPACEMAN_WS = 'wss://dga.pragmaticplaylive.net/ws'
-SPACEMAN_CASINO_ID = 'ppcdk00000005349'
-SPACEMAN_CURRENCY = 'BRL'
-SPACEMAN_GAME_ID = 1301
-
+# 30+ user‑agents rotativos
 USER_AGENTS = [
+    # Windows + Chrome
     'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/118.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/117.0.0.0 Safari/537.36',
+    # Windows + Firefox
+    'Mozilla/5.0 (Windows NT 10.0; rv:121.0) Gecko/20100101 Firefox/121.0',
+    'Mozilla/5.0 (Windows NT 10.0; rv:120.0) Gecko/20100101 Firefox/120.0',
+    'Mozilla/5.0 (Windows NT 10.0; rv:119.0) Gecko/20100101 Firefox/119.0',
+    # Windows + Edge
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 Edg/120.0.0.0',
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36 Edg/119.0.0.0',
+    # macOS + Safari
     'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15',
-    'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36',
-    'Mozilla/5.0 (Windows NT 10.0; rv:109.0) Gecko/20100101 Firefox/121.0',
-    'Mozilla/5.0 (iPhone; CPU iPhone OS 17_1_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1'
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Safari/605.1.15',
+    # macOS + Chrome
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36',
+    # Linux
+    'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:121.0) Gecko/20100101 Firefox/121.0',
+    # iOS
+    'Mozilla/5.0 (iPhone; CPU iPhone OS 17_1_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1',
+    'Mozilla/5.0 (iPad; CPU OS 17_1_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1',
+    # Android
+    'Mozilla/5.0 (Linux; Android 14; SM-S918B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.6099.230 Mobile Safari/537.36',
+    'Mozilla/5.0 (Linux; Android 13; SM-G998B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.6045.163 Mobile Safari/537.36',
+    # Bots (algunas APIs los permiten)
+    'Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)',
+    'Mozilla/5.0 (compatible; Bingbot/2.0; +http://www.bing.com/bingbot.htm)',
+    # Otros
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:115.0) Gecko/20100101 Firefox/115.0',
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:115.0) Gecko/20100101 Firefox/115.0',
+    'Mozilla/5.0 (X11; CrOS x86_64 14541.0.0) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
 ]
 
 DB_FILE = 'eventos.db'
-MAX_HISTORY = 600
+MAX_HISTORY = 600          # Número máximo de eventos por API
+
+# Configuración de backoff
+BASE_SLEEP = 1.0
+MAX_SLEEP = 60.0
 
 # ============================================
 # BASE DE DATOS
@@ -67,7 +94,7 @@ def guardar_evento(api, event_id, maxMultiplier, roundDuration, startedAt):
                  VALUES (?, ?, ?, ?, ?, ?)''',
               (api, event_id, maxMultiplier, roundDuration, startedAt, timestamp))
     conn.commit()
-    # Eliminar antiguos (mantener últimos 600 por api)
+    # Mantener solo los últimos MAX_HISTORY eventos por API
     c.execute('''DELETE FROM eventos WHERE id IN (
                     SELECT id FROM eventos WHERE api = ? ORDER BY timestamp_recepcion DESC LIMIT -1 OFFSET ?
                 )''', (api, MAX_HISTORY))
@@ -95,13 +122,13 @@ def obtener_ultimos_eventos(api, limite=MAX_HISTORY):
     return eventos
 
 # ============================================
-# SESIÓN HTTP CON REINTENTOS
+# CONFIGURACIÓN DE SESIÓN HTTP
 # ============================================
 def crear_sesion():
     sesion = requests.Session()
     retry = Retry(
-        total=3,
-        backoff_factor=0.5,
+        total=2,                         # reintentos totales (evita ciclos largos)
+        backoff_factor=0.1,
         status_forcelist=[429, 500, 502, 503, 504],
         allowed_methods=['GET']
     )
@@ -110,23 +137,78 @@ def crear_sesion():
     sesion.mount('https://', adapter)
     return sesion
 
-sesion = crear_sesion()
+# Usaremos una sesión global, pero rotaremos user-agent por petición
+sesion_global = crear_sesion()
 
-def consultar_api(url, api_nombre):
-    headers = {'User-Agent': random.choice(USER_AGENTS)}
+# ============================================
+# FUNCIÓN DE CONSULTA CON BACKOFF Y ROTACIÓN DE USER-AGENT
+# ============================================
+# Estado por API (crash y slide)
+api_status = {
+    'crash': {'consecutive_errors': 0, 'next_allowed_time': 0},
+    'slide': {'consecutive_errors': 0, 'next_allowed_time': 0}
+}
+
+def get_random_user_agent():
+    return random.choice(USER_AGENTS)
+
+def consultar_con_backoff(url, api_nombre):
+    status = api_status[api_nombre]
+    now = time.time()
+
+    # Si la API está en período de espera, dormir y retornar None
+    if now < status['next_allowed_time']:
+        wait = status['next_allowed_time'] - now
+        print(f"⏳ {api_nombre} en espera por {wait:.1f}s (backoff)")
+        time.sleep(wait)
+        return None
+
+    headers = {'User-Agent': get_random_user_agent()}
     try:
-        resp = sesion.get(url, headers=headers, timeout=5)
-        if resp.status_code == 200:
-            return resp.json()
-        else:
-            print(f"⚠️ {api_nombre} - Código HTTP {resp.status_code}")
+        resp = sesion_global.get(url, headers=headers, timeout=5)
+
+        # Si la API pide esperar con Retry-After
+        if 'Retry-After' in resp.headers:
+            retry_after = int(resp.headers['Retry-After'])
+            status['next_allowed_time'] = time.time() + retry_after
+            status['consecutive_errors'] += 1
+            print(f"⚠️ {api_nombre} pide esperar {retry_after}s")
             return None
+
+        if resp.status_code == 200:
+            status['consecutive_errors'] = 0
+            return resp.json()
+        elif resp.status_code == 429:
+            retry_after = int(resp.headers.get('Retry-After', 2 ** status['consecutive_errors']))
+            status['next_allowed_time'] = time.time() + retry_after
+            status['consecutive_errors'] += 1
+            print(f"⚠️ {api_nombre} rate limited. Esperando {retry_after}s")
+            return None
+        elif 500 <= resp.status_code < 600:
+            status['consecutive_errors'] += 1
+            backoff = min(MAX_SLEEP, BASE_SLEEP * (2 ** status['consecutive_errors']))
+            status['next_allowed_time'] = time.time() + backoff
+            print(f"❌ {api_nombre} error {resp.status_code}. Backoff {backoff:.1f}s")
+            return None
+        else:
+            print(f"⚠️ {api_nombre} código no esperado: {resp.status_code}")
+            return None
+
+    except requests.exceptions.Timeout:
+        status['consecutive_errors'] += 1
+        backoff = min(MAX_SLEEP, BASE_SLEEP * (2 ** status['consecutive_errors']))
+        status['next_allowed_time'] = time.time() + backoff
+        print(f"⏰ {api_nombre} timeout. Backoff {backoff:.1f}s")
+        return None
     except Exception as e:
-        print(f"❌ {api_nombre} - Error: {e}")
+        status['consecutive_errors'] += 1
+        backoff = min(MAX_SLEEP, BASE_SLEEP * (2 ** status['consecutive_errors']))
+        status['next_allowed_time'] = time.time() + backoff
+        print(f"💥 {api_nombre} error: {e}. Backoff {backoff:.1f}s")
         return None
 
 # ============================================
-# SERVIDOR WEBSOCKET (para clientes)
+# SERVIDOR WEBSOCKET
 # ============================================
 connected_clients = set()
 websocket_loop = None
@@ -135,8 +217,8 @@ stop_websocket = threading.Event()
 async def websocket_handler(websocket):
     connected_clients.add(websocket)
     try:
-        # Enviar historial al conectar
-        for api in ['crash', 'slide', 'spaceman']:
+        # Enviar historial al conectar (para crash y slide)
+        for api in ['crash', 'slide']:
             eventos = obtener_ultimos_eventos(api, MAX_HISTORY)
             if eventos:
                 await websocket.send(json.dumps({
@@ -165,6 +247,7 @@ def start_websocket_server():
     except Exception as e:
         print(f"Error en WebSocket server: {e}")
 
+# Lanzar servidor WebSocket en un hilo separado
 threading.Thread(target=start_websocket_server, daemon=True).start()
 
 async def _async_broadcast(message):
@@ -181,117 +264,85 @@ def broadcast(event_data):
     asyncio.run_coroutine_threadsafe(_async_broadcast(message), websocket_loop)
 
 # ============================================
-# CLIENTE WEBSOCKET PARA SPACEMAN
-# ============================================
-def spaceman_client():
-    def on_message(ws, message):
-        try:
-            data = json.loads(message)
-            if data.get('type') == 'gameResult' and 'gameResult' in data:
-                for game in data['gameResult']:
-                    event_id = str(game.get('id', int(time.time()*1000)))
-                    maxMultiplier = float(game.get('result', 0))
-                    startedAt = game.get('startTime', datetime.now().isoformat())
-                    timestamp = guardar_evento('spaceman', event_id, maxMultiplier, None, startedAt)
-                    broadcast({
-                        'tipo': 'spaceman',
-                        'id': event_id,
-                        'maxMultiplier': maxMultiplier,
-                        'roundDuration': None,
-                        'startedAt': startedAt,
-                        'timestamp_recepcion': timestamp
-                    })
-                    print(f"✅ Spaceman nuevo: ID={event_id} maxMult={maxMultiplier}")
-        except Exception as e:
-            print(f"Error procesando Spaceman: {e}")
-
-    def on_error(ws, error):
-        print(f"❌ Spaceman error: {error}")
-
-    def on_close(ws, close_status_code, close_msg):
-        print("🔌 Spaceman desconectado, reconectando en 5s...")
-        time.sleep(5)
-        spaceman_client()
-
-    def on_open(ws):
-        print("✅ Conectado a Spaceman (Pragmatic Play)")
-        subscribe_msg = {
-            "type": "subscribe",
-            "casinoId": SPACEMAN_CASINO_ID,
-            "currency": SPACEMAN_CURRENCY,
-            "key": [SPACEMAN_GAME_ID]
-        }
-        ws.send(json.dumps(subscribe_msg))
-
-    ws = websocket.WebSocketApp(SPACEMAN_WS,
-                                on_open=on_open,
-                                on_message=on_message,
-                                on_error=on_error,
-                                on_close=on_close)
-    ws.run_forever()
-
-threading.Thread(target=spaceman_client, daemon=True).start()
-
-# ============================================
 # BUCLE PRINCIPAL (Crash y Slide)
 # ============================================
-print("🚀 Iniciando monitoreo de Crash y Slide cada 1 segundo. Presiona Ctrl+C para detener.")
+print("🚀 Iniciando monitoreo robusto de Crash y Slide. Presiona Ctrl+C para detener.")
 
 crash_ids = set()
 slide_ids = set()
 
 try:
     while True:
-        start_time = time.time()
+        now = time.time()
 
-        # Crash
-        crash_data = consultar_api(API_CRASH, 'CRASH')
-        if crash_data:
-            api_id = crash_data.get('id')
-            if api_id and api_id not in crash_ids:
-                crash_ids.add(api_id)
-                data_inner = crash_data.get('data', {})
-                result = data_inner.get('result', {})
-                max_mult = result.get('maxMultiplier')
-                round_dur = result.get('roundDuration')
-                started_at = data_inner.get('startedAt')
-                timestamp = guardar_evento('crash', api_id, max_mult, round_dur, started_at)
-                broadcast({
-                    'tipo': 'crash',
-                    'id': api_id,
-                    'maxMultiplier': max_mult,
-                    'roundDuration': round_dur,
-                    'startedAt': started_at,
-                    'timestamp_recepcion': timestamp
-                })
-                print(f"✅ Crash nuevo: ID={api_id} maxMult={max_mult}")
+        # --- Crash ---
+        if now >= api_status['crash']['next_allowed_time']:
+            crash_data = consultar_con_backoff(API_CRASH, 'crash')
+            if crash_data:
+                api_id = crash_data.get('id')
+                if api_id and api_id not in crash_ids:
+                    crash_ids.add(api_id)
+                    data_inner = crash_data.get('data', {})
+                    result = data_inner.get('result', {})
+                    max_mult = result.get('maxMultiplier')
+                    round_dur = result.get('roundDuration')
+                    started_at = data_inner.get('startedAt')
 
-        # Slide
-        slide_data = consultar_api(API_SLIDE, 'SLIDE')
-        if slide_data:
-            api_id = slide_data.get('id')
-            if api_id and api_id not in slide_ids:
-                slide_ids.add(api_id)
-                data_inner = slide_data.get('data', {})
-                result = data_inner.get('result', {})
-                max_mult = result.get('maxMultiplier')
-                round_dur = None
-                started_at = data_inner.get('startedAt')
-                timestamp = guardar_evento('slide', api_id, max_mult, round_dur, started_at)
-                broadcast({
-                    'tipo': 'slide',
-                    'id': api_id,
-                    'maxMultiplier': max_mult,
-                    'roundDuration': None,
-                    'startedAt': started_at,
-                    'timestamp_recepcion': timestamp
-                })
-                print(f"✅ Slide nuevo: ID={api_id} maxMult={max_mult}")
+                    # Validar multiplicador
+                    if max_mult is not None and max_mult > 0:
+                        timestamp = guardar_evento('crash', api_id, max_mult, round_dur, started_at)
+                        broadcast({
+                            'tipo': 'crash',
+                            'id': api_id,
+                            'maxMultiplier': max_mult,
+                            'roundDuration': round_dur,
+                            'startedAt': started_at,
+                            'timestamp_recepcion': timestamp
+                        })
+                        print(f"✅ Crash nuevo: ID={api_id} maxMult={max_mult}")
+                    else:
+                        print(f"⚠️ Crash ID {api_id} con multiplicador inválido: {max_mult}")
 
-        elapsed = time.time() - start_time
-        sleep_time = max(0, 1.0 - elapsed)
-        time.sleep(sleep_time)
+        # --- Slide ---
+        if now >= api_status['slide']['next_allowed_time']:
+            slide_data = consultar_con_backoff(API_SLIDE, 'slide')
+            if slide_data:
+                api_id = slide_data.get('id')
+                if api_id and api_id not in slide_ids:
+                    slide_ids.add(api_id)
+                    data_inner = slide_data.get('data', {})
+                    result = data_inner.get('result', {})
+                    max_mult = result.get('maxMultiplier')
+                    started_at = data_inner.get('startedAt')
+
+                    if max_mult is not None and max_mult > 0:
+                        timestamp = guardar_evento('slide', api_id, max_mult, None, started_at)
+                        broadcast({
+                            'tipo': 'slide',
+                            'id': api_id,
+                            'maxMultiplier': max_mult,
+                            'roundDuration': None,
+                            'startedAt': started_at,
+                            'timestamp_recepcion': timestamp
+                        })
+                        print(f"✅ Slide nuevo: ID={api_id} maxMult={max_mult}")
+                    else:
+                        print(f"⚠️ Slide ID {api_id} con multiplicador inválido: {max_mult}")
+
+        # Espera inteligente con jitter
+        next_crash = api_status['crash']['next_allowed_time']
+        next_slide = api_status['slide']['next_allowed_time']
+        next_allowed = min(next_crash, next_slide)
+        wait = max(0, next_allowed - time.time())
+        if wait > 0:
+            # Añadir un pequeño jitter (±10%) para evitar patrones fijos
+            jitter = random.uniform(0.9, 1.1)
+            time.sleep(wait * jitter)
+        else:
+            time.sleep(0.5)  # pausa mínima
 
 except KeyboardInterrupt:
-    print("\n⏹ Monitoreo detenido.")
+    print("\n⏹ Monitoreo detenido por el usuario.")
     stop_websocket.set()
+    # Pequeña espera para que el servidor WebSocket termine
+    time.sleep(1)
