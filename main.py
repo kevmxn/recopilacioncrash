@@ -3,7 +3,6 @@
 
 import requests
 import time
-import pandas as pd
 import sqlite3
 import threading
 import asyncio
@@ -14,8 +13,7 @@ import random
 from datetime import datetime
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
-import websocket  # websocket-client para el cliente Spaceman
-import threading
+import websocket  # websocket-client para Spaceman
 
 # ============================================
 # CONFIGURACIÓN
@@ -23,7 +21,7 @@ import threading
 API_CRASH = 'https://api-cs.casino.org/svc-evolution-game-events/api/stakecrash/latest'
 API_SLIDE = 'https://api-cs.casino.org/svc-evolution-game-events/api/stakeslide/latest'
 
-# Configuración Spaceman (Pragmatic Play)
+# Spaceman (Pragmatic Play)
 SPACEMAN_WS = 'wss://dga.pragmaticplaylive.net/ws'
 SPACEMAN_CASINO_ID = 'ppcdk00000005349'
 SPACEMAN_CURRENCY = 'BRL'
@@ -37,11 +35,11 @@ USER_AGENTS = [
     'Mozilla/5.0 (iPhone; CPU iPhone OS 17_1_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1'
 ]
 
-DB_FILE = 'eventos.db'  # Base de datos SQLite
-MAX_HISTORY = 600       # Número máximo de eventos a guardar por API
+DB_FILE = 'eventos.db'
+MAX_HISTORY = 600
 
 # ============================================
-# INICIALIZAR BASE DE DATOS
+# BASE DE DATOS
 # ============================================
 def init_db():
     conn = sqlite3.connect(DB_FILE)
@@ -54,7 +52,6 @@ def init_db():
                   roundDuration REAL,
                   startedAt TEXT,
                   timestamp_recepcion TEXT)''')
-    # Índices para búsqueda rápida
     c.execute('CREATE INDEX IF NOT EXISTS idx_api ON eventos (api)')
     c.execute('CREATE INDEX IF NOT EXISTS idx_timestamp ON eventos (timestamp_recepcion)')
     conn.commit()
@@ -62,9 +59,6 @@ def init_db():
 
 init_db()
 
-# ============================================
-# GUARDAR EVENTO EN BASE DE DATOS Y LIMITAR A 600 POR API
-# ============================================
 def guardar_evento(api, event_id, maxMultiplier, roundDuration, startedAt):
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
@@ -73,8 +67,7 @@ def guardar_evento(api, event_id, maxMultiplier, roundDuration, startedAt):
                  VALUES (?, ?, ?, ?, ?, ?)''',
               (api, event_id, maxMultiplier, roundDuration, startedAt, timestamp))
     conn.commit()
-    
-    # Eliminar eventos antiguos si se superan los 600 por API
+    # Eliminar antiguos (mantener últimos 600 por api)
     c.execute('''DELETE FROM eventos WHERE id IN (
                     SELECT id FROM eventos WHERE api = ? ORDER BY timestamp_recepcion DESC LIMIT -1 OFFSET ?
                 )''', (api, MAX_HISTORY))
@@ -82,9 +75,6 @@ def guardar_evento(api, event_id, maxMultiplier, roundDuration, startedAt):
     conn.close()
     return timestamp
 
-# ============================================
-# OBTENER ÚLTIMOS EVENTOS (para historial)
-# ============================================
 def obtener_ultimos_eventos(api, limite=MAX_HISTORY):
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
@@ -105,7 +95,7 @@ def obtener_ultimos_eventos(api, limite=MAX_HISTORY):
     return eventos
 
 # ============================================
-# CONFIGURACIÓN DE SESIÓN HTTP CON REINTENTOS
+# SESIÓN HTTP CON REINTENTOS
 # ============================================
 def crear_sesion():
     sesion = requests.Session()
@@ -122,9 +112,6 @@ def crear_sesion():
 
 sesion = crear_sesion()
 
-# ============================================
-# FUNCIÓN DE CONSULTA A APIs REST (Crash y Slide)
-# ============================================
 def consultar_api(url, api_nombre):
     headers = {'User-Agent': random.choice(USER_AGENTS)}
     try:
@@ -139,17 +126,16 @@ def consultar_api(url, api_nombre):
         return None
 
 # ============================================
-# WEBSOCKET SERVER (para clientes)
+# SERVIDOR WEBSOCKET (para clientes)
 # ============================================
 connected_clients = set()
 websocket_loop = None
 stop_websocket = threading.Event()
 
 async def websocket_handler(websocket):
-    """Maneja una conexión de cliente: envía historial y registra."""
     connected_clients.add(websocket)
     try:
-        # Enviar historial de los últimos eventos de cada API
+        # Enviar historial al conectar
         for api in ['crash', 'slide', 'spaceman']:
             eventos = obtener_ultimos_eventos(api, MAX_HISTORY)
             if eventos:
@@ -158,7 +144,6 @@ async def websocket_handler(websocket):
                     'api': api,
                     'eventos': eventos
                 }, default=str))
-        # Mantener conexión
         await websocket.wait_closed()
     finally:
         connected_clients.remove(websocket)
@@ -180,12 +165,8 @@ def start_websocket_server():
     except Exception as e:
         print(f"Error en WebSocket server: {e}")
 
-# Iniciar servidor WebSocket en hilo separado
 threading.Thread(target=start_websocket_server, daemon=True).start()
 
-# ============================================
-# FUNCIÓN PARA ENVIAR EVENTO A TODOS LOS CLIENTES
-# ============================================
 async def _async_broadcast(message):
     if connected_clients:
         await asyncio.gather(
@@ -194,30 +175,24 @@ async def _async_broadcast(message):
         )
 
 def broadcast(event_data):
-    """Envía un evento a todos los clientes (thread-safe)."""
     if websocket_loop is None or not connected_clients:
         return
     message = json.dumps(event_data, default=str)
     asyncio.run_coroutine_threadsafe(_async_broadcast(message), websocket_loop)
 
 # ============================================
-# CLIENTE WEBSOCKET PARA SPACEMAN (Pragmatic Play)
+# CLIENTE WEBSOCKET PARA SPACEMAN
 # ============================================
 def spaceman_client():
-    """Se conecta al WebSocket de Pragmatic Play y reenvía eventos."""
     def on_message(ws, message):
         try:
             data = json.loads(message)
-            # Verificar si es un resultado de juego
             if data.get('type') == 'gameResult' and 'gameResult' in data:
                 for game in data['gameResult']:
-                    # Extraer datos relevantes
-                    event_id = str(game.get('id', int(time.time()*1000)))  # fallback a timestamp
+                    event_id = str(game.get('id', int(time.time()*1000)))
                     maxMultiplier = float(game.get('result', 0))
                     startedAt = game.get('startTime', datetime.now().isoformat())
-                    # Guardar en BD
                     timestamp = guardar_evento('spaceman', event_id, maxMultiplier, None, startedAt)
-                    # Transmitir a clientes
                     broadcast({
                         'tipo': 'spaceman',
                         'id': event_id,
@@ -228,19 +203,18 @@ def spaceman_client():
                     })
                     print(f"✅ Spaceman nuevo: ID={event_id} maxMult={maxMultiplier}")
         except Exception as e:
-            print(f"Error procesando mensaje de Spaceman: {e}")
+            print(f"Error procesando Spaceman: {e}")
 
     def on_error(ws, error):
-        print(f"❌ Spaceman WebSocket error: {error}")
+        print(f"❌ Spaceman error: {error}")
 
     def on_close(ws, close_status_code, close_msg):
-        print("🔌 Spaceman WebSocket cerrado. Reconectando en 5s...")
+        print("🔌 Spaceman desconectado, reconectando en 5s...")
         time.sleep(5)
-        spaceman_client()  # reconectar
+        spaceman_client()
 
     def on_open(ws):
         print("✅ Conectado a Spaceman (Pragmatic Play)")
-        # Suscribirse
         subscribe_msg = {
             "type": "subscribe",
             "casinoId": SPACEMAN_CASINO_ID,
@@ -249,7 +223,6 @@ def spaceman_client():
         }
         ws.send(json.dumps(subscribe_msg))
 
-    # Configurar y conectar
     ws = websocket.WebSocketApp(SPACEMAN_WS,
                                 on_open=on_open,
                                 on_message=on_message,
@@ -257,11 +230,10 @@ def spaceman_client():
                                 on_close=on_close)
     ws.run_forever()
 
-# Iniciar cliente Spaceman en hilo separado
 threading.Thread(target=spaceman_client, daemon=True).start()
 
 # ============================================
-# BUCLE PRINCIPAL (consultas a Crash y Slide)
+# BUCLE PRINCIPAL (Crash y Slide)
 # ============================================
 print("🚀 Iniciando monitoreo de Crash y Slide cada 1 segundo. Presiona Ctrl+C para detener.")
 
@@ -272,7 +244,7 @@ try:
     while True:
         start_time = time.time()
 
-        # --- Consultar Crash ---
+        # Crash
         crash_data = consultar_api(API_CRASH, 'CRASH')
         if crash_data:
             api_id = crash_data.get('id')
@@ -283,23 +255,18 @@ try:
                 max_mult = result.get('maxMultiplier')
                 round_dur = result.get('roundDuration')
                 started_at = data_inner.get('startedAt')
-
-                # Guardar en BD
                 timestamp = guardar_evento('crash', api_id, max_mult, round_dur, started_at)
-
-                # Enviar por WebSocket
-                event = {
+                broadcast({
                     'tipo': 'crash',
                     'id': api_id,
                     'maxMultiplier': max_mult,
                     'roundDuration': round_dur,
                     'startedAt': started_at,
                     'timestamp_recepcion': timestamp
-                }
-                broadcast(event)
+                })
                 print(f"✅ Crash nuevo: ID={api_id} maxMult={max_mult}")
 
-        # --- Consultar Slide ---
+        # Slide
         slide_data = consultar_api(API_SLIDE, 'SLIDE')
         if slide_data:
             api_id = slide_data.get('id')
@@ -310,18 +277,15 @@ try:
                 max_mult = result.get('maxMultiplier')
                 round_dur = None
                 started_at = data_inner.get('startedAt')
-
                 timestamp = guardar_evento('slide', api_id, max_mult, round_dur, started_at)
-
-                event = {
+                broadcast({
                     'tipo': 'slide',
                     'id': api_id,
                     'maxMultiplier': max_mult,
                     'roundDuration': None,
                     'startedAt': started_at,
                     'timestamp_recepcion': timestamp
-                }
-                broadcast(event)
+                })
                 print(f"✅ Slide nuevo: ID={api_id} maxMult={max_mult}")
 
         elapsed = time.time() - start_time
@@ -329,5 +293,5 @@ try:
         time.sleep(sleep_time)
 
 except KeyboardInterrupt:
-    print("\n⏹ Monitoreo detenido por el usuario.")
+    print("\n⏹ Monitoreo detenido.")
     stop_websocket.set()
